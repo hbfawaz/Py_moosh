@@ -8,6 +8,74 @@ from PyMoosh.core import cascade
 import copy
 import itertools
 import matplotlib.pyplot as plt
+from scipy.optimize import minimize
+
+
+
+
+
+def find_mode_scipy(start, tol, step_max, struct, wl, pol):
+    """
+    Find the mode of a multilayer structure by minimizing the dispersion function using SciPy's BFGS algorithm.
+
+    Args:
+        start (complex): Initial guess for the effective index.
+        tol (float): Tolerance for stopping criterion (function value < tol).
+        step_max (int): Maximum number of iterations allowed.
+        struct (Structure): The multilayer structure object.
+        wl (float): Wavelength in vacuum (nanometers).
+        pol (int): Polarization (0 for TE, 1 for TM).
+
+    Returns:
+        complex: The effective index where the dispersion function is minimized.
+    """
+    k0 = 2 * np.pi / wl
+    initial_alpha = start * k0
+    x0 = initial_alpha.real
+    y0 = initial_alpha.imag
+    initial_params = np.array([x0, y0])
+
+    def objective(params):
+        x, y = params
+        alpha = x + 1j * y
+        return dispersion(alpha, struct, wl, pol)
+
+    def gradient(params):
+        x, y = params
+        alpha = x + 1j * y
+        h = 1e-8  # Step size
+        #df/dx
+        alpha_dx = alpha + h
+        df_dx = (dispersion(alpha_dx, struct, wl, pol) - dispersion(alpha, struct, wl, pol)) / h
+        #df/dy
+        alpha_dy = alpha + 1j * h
+        df_dy = (dispersion(alpha_dy, struct, wl, pol) - dispersion(alpha, struct, wl, pol)) / h
+        return np.array([df_dx, df_dy])
+
+    def callback(params):
+        current_value = objective(params)
+        if current_value < tol:
+            return True  # Stop optimization
+        return False
+
+    #BFGS
+    result = minimize(
+        fun=objective,
+        x0=initial_params,
+        method='BFGS',
+        jac=gradient,
+        options={
+            'maxiter': step_max,
+            'disp': False
+        },
+        callback=callback
+    )
+
+    x_opt, y_opt = result.x
+    alpha_opt = x_opt + 1j * y_opt
+    return alpha_opt/k0
+
+
 
 
 def NLdispersion(alpha,struct,wavelength,polarization):
