@@ -61,7 +61,7 @@ class NLMaterial(Material):
 
             All non local materials need: beta0, tau, omegap
             + all the parameters needed in their respective functions
-            custom function must return: beta2, chi_b, chi_f, omega_p
+            custom function must return: beta2 (m s-1), chi_b (non dim), chi_f (non dim), omega_p (Hz, or a different order of magnitude, to work with nm later, see NLcoefficient KL)
     """
 
     def __init__(self, mat, verbose=False):

@@ -13,61 +13,85 @@ from scipy.optimize import minimize
 
 def find_mode_scipy(start, tol, step_max, struct, wl, pol):
     """
-    IT IS GOING INSANE AT THE MOMENT, NEGATIVE N_EFF, UNPHYSICAL MODES, YOU NAME IT.
-
-    Find the mode of a multilayer structure by minimizing the dispersion function using SciPy's BFGS algorithm.
+    Finds the mode of a multilayer structure by minimizing the LOCAL dispersion
+    function using SciPy's BFGS algorithm with numerical gradient.
 
     Args:
         start (complex): Initial guess for the effective index.
-        tol (float): Tolerance for stopping criterion (function value < tol).
+        tol (float): Tolerance influencing optimizer stopping criterion (gtol).
         step_max (int): Maximum number of iterations allowed.
         struct (Structure): The multilayer structure object.
         wl (float): Wavelength in vacuum (nanometers).
         pol (int): Polarization (0 for TE, 1 for TM).
 
     Returns:
-        complex: The effective index where the dispersion function is minimized.
+        complex: The effective index where the dispersion function is minimized,
+                 or NaN if optimization fails.
     """
+    # Basic setup
+    # Unit conversion should ideally happen inside dispersion or before calling
     k0 = 2 * np.pi / wl
+    if np.isnan(start) or not np.isfinite(start):
+        print("Warning: Invalid start value provided.")
+        return np.nan
     initial_alpha = start * k0
-    x0 = initial_alpha.real
-    y0 = initial_alpha.imag
-    initial_params = np.array([x0, y0])
+    initial_params = np.array([initial_alpha.real, initial_alpha.imag])
 
-    def objective(params):
+    # Objective function (calls local dispersion)
+    def objective(params, structure, wavelength, polarization):
+        # Passed args must be positional after params
         x, y = params
-        alpha = x + 1j * y
-        return dispersion(alpha, struct, wl, pol)
+        alpha = x + 1j*y
+        try:
+            # Ensure dispersion returns a float (1/abs(r))
+            val = dispersion(alpha, structure, wavelength, polarization)
+            return val if np.isfinite(val) else np.inf # Handle potential NaN/Inf
+        except Exception as e:
+            # print(f"Error in objective at {alpha}: {e}") # for debugging
+            return np.inf
 
-    def gradient(params):
-        x, y = params
-        alpha = x + 1j * y
-        h = 1e-8  # Step size
-        current = dispersion(alpha, struct, wl, pol)
 
-        alpha_dx = alpha + h
-        alpha_dy = alpha + 1j * h
-        df_dx = (dispersion(alpha_dx, struct, wl, pol) - current) / h
-        df_dy = (dispersion(alpha_dy, struct, wl, pol) - current) / h
 
-        return np.array([df_dx, df_dy])
+    # --- Optimization using BFGS with SciPy's numerical gradient ---
+    final_neff = np.nan # Default return value
+    result = None
+    try:
+        result = minimize(
+            fun=objective,
+            x0=initial_params,
+            args=(struct, wl, pol), # Pass extra arguments for objective here
+            method='BFGS',
+            jac=None, # <-- LET SCIPY CALCULATE GRADIENT NUMERICALLY
+            options={
+                'maxiter': step_max,
+                'disp': False,
+                'gtol': tol # Use tol to influence gradient tolerance
+            },
+            tol=None # Use options for tolerance criteria
+        )
 
-    # BFGS
-    result = minimize(
-        fun=objective,
-        x0=initial_params,
-        method='BFGS',
-        jac=gradient,
-        options={
-            'maxiter': step_max,
-            'gtol': tol,
-            'disp': False
-        }
-    )
+        if result.success:
+            x_opt, y_opt = result.x
+            alpha_opt = x_opt + 1j*y_opt
+            final_neff = alpha_opt/k0
+            # Optional: Check final function value
+            final_val = result.fun
+            # You might set a threshold for final_val if needed,
+            # e.g., if final_val > 1e-3: print("Warning: Min value not close to zero")
+        else:
+             print(f"Warning: Optimization failed - {result.message} (start={start})")
+             # Optionally return last point even on failure, but NaN is safer
+             final_neff = np.nan # Return NaN on failure
 
-    x_opt, y_opt = result.x
-    alpha_opt = x_opt + 1j * y_opt
-    return alpha_opt / k0
+    except Exception as e:
+         print(f"Error during scipy.optimize.minimize call: {e}")
+         final_neff = np.nan # Return NaN on unexpected error
+
+    # Optional: Print max iteration warning if result object exists
+    if result is not None and 'nit' in result and result.nit >= step_max:
+         print(f"Warning: maximum number of iterations reached ({step_max})")
+
+    return final_neff
 
 
 def NLdispersion(alpha, struct, wavelength, polarization):
