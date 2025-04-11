@@ -7,9 +7,56 @@ import numpy as np
 import copy
 from PyMoosh.core import conv_to_nm
 from PyMoosh.classes import Material, Structure
+from scipy.special import wofz
 
 
 # TODO: add other functionalities (field/absorption, etc.)
+
+
+planck_eVm = 1.2398419843320028e-06
+electron_C = 1.602176634e-19
+hbar_Js = 1.054571817e-34
+rad_per_eV = electron_C/hbar_Js
+
+f0=0.770
+Gamma0=0.050
+omega_p=9.03
+f=np.array([0.054,0.050,0.312,0.719,1.648])
+Gamma=np.array([0.074,0.035,0.083,0.125,0.179])
+omega=np.array([0.218,2.885,4.069,6.137,27.97])
+sigma=np.array([0.742,0.349,0.830,1.246,1.795])
+
+# above are in eV
+
+vFermi_mps = 1.39e6
+hyd_factor =  3/5
+
+
+def calc_gold_nl_param(wavelength):
+
+    '''
+
+    non local gold parameters from empirical value
+
+    '''
+    wav_ev = planck_eVm/(wavelength * 1e-9)
+
+    chi_f = -omega_p**2 * f0 / (wav_ev*(wav_ev+1j * Gamma0))
+
+    a = np.sqrt(wav_ev * (wav_ev + 1j * Gamma))
+    x = (a - omega) / (np.sqrt(2) * sigma)
+    y = (a + omega) / (np.sqrt(2) * sigma)
+    denominator = (2 * np.sqrt(2) * a * sigma)
+    term_sum = (1j * np.sqrt(np.pi) * f * omega_p ** 2) / denominator * (wofz(x) + wofz(y))
+    chi_b = np.sum(term_sum)
+
+    beta2_mps_sq = hyd_factor * vFermi_mps ** 2
+    beta2_nm_sq = beta2_mps_sq * 1e18
+    omega_p_rad_s = omega_p * rad_per_eV
+
+    return beta2_nm_sq, chi_b, chi_f, omega_p_rad_s
+
+
 
 class NLStructure(Structure):
     """
