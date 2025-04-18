@@ -11,87 +11,6 @@ import matplotlib.pyplot as plt
 from scipy.optimize import minimize
 
 
-def find_mode_scipy(start, tol, step_max, struct, wl, pol):
-    """
-    Finds the mode of a multilayer structure by minimizing the LOCAL dispersion
-    function using SciPy's BFGS algorithm with numerical gradient.
-
-    Args:
-        start (complex): Initial guess for the effective index.
-        tol (float): Tolerance influencing optimizer stopping criterion (gtol).
-        step_max (int): Maximum number of iterations allowed.
-        struct (Structure): The multilayer structure object.
-        wl (float): Wavelength in vacuum (nanometers).
-        pol (int): Polarization (0 for TE, 1 for TM).
-
-    Returns:
-        complex: The effective index where the dispersion function is minimized,
-                 or NaN if optimization fails.
-    """
-    # Basic setup
-    # Unit conversion should ideally happen inside dispersion or before calling
-    k0 = 2 * np.pi / wl
-    if np.isnan(start) or not np.isfinite(start):
-        print("Warning: Invalid start value provided.")
-        return np.nan
-    initial_alpha = start * k0
-    initial_params = np.array([initial_alpha.real, initial_alpha.imag])
-
-    # Objective function (calls local dispersion)
-    def objective(params, structure, wavelength, polarization):
-        # Passed args must be positional after params
-        x, y = params
-        alpha = x + 1j*y
-        try:
-            # Ensure dispersion returns a float (1/abs(r))
-            val = dispersion(alpha, structure, wavelength, polarization)
-            return val if np.isfinite(val) else np.inf # Handle potential NaN/Inf
-        except Exception as e:
-            # print(f"Error in objective at {alpha}: {e}") # for debugging
-            return np.inf
-
-
-
-    # --- Optimization using BFGS with SciPy's numerical gradient ---
-    final_neff = np.nan # Default return value
-    result = None
-    try:
-        result = minimize(
-            fun=objective,
-            x0=initial_params,
-            args=(struct, wl, pol), # Pass extra arguments for objective here
-            method='BFGS',
-            jac=None, # <-- LET SCIPY CALCULATE GRADIENT NUMERICALLY
-            options={
-                'maxiter': step_max,
-                'disp': False,
-                'gtol': tol # Use tol to influence gradient tolerance
-            },
-            tol=None # Use options for tolerance criteria
-        )
-
-        if result.success:
-            x_opt, y_opt = result.x
-            alpha_opt = x_opt + 1j*y_opt
-            final_neff = alpha_opt/k0
-            # Optional: Check final function value
-            final_val = result.fun
-            # You might set a threshold for final_val if needed,
-            # e.g., if final_val > 1e-3: print("Warning: Min value not close to zero")
-        else:
-             print(f"Warning: Optimization failed - {result.message} (start={start})")
-             # Optionally return last point even on failure, but NaN is safer
-             final_neff = np.nan # Return NaN on failure
-
-    except Exception as e:
-         print(f"Error during scipy.optimize.minimize call: {e}")
-         final_neff = np.nan # Return NaN on unexpected error
-
-    # Optional: Print max iteration warning if result object exists
-    if result is not None and 'nit' in result and result.nit >= step_max:
-         print(f"Warning: maximum number of iterations reached ({step_max})")
-
-    return final_neff
 
 
 def NLdispersion(alpha, struct, wavelength, polarization):
@@ -119,22 +38,123 @@ def NLdispersion(alpha, struct, wavelength, polarization):
 
     """
 
+    # In order to get a phase that corresponds to the expected reflected coefficient, we make the height of the upper (lossless) medium vanish. It changes only the phase of the reflection coefficient.
+    # The medium may be dispersive. The permittivity and permability of each layer has to be computed each time.
     if (struct.unit != "nm"):
         wavelength = conv_to_nm(wavelength, struct.unit)
+
     Epsilon_mat, Mu_mat = struct.polarizability(wavelength)
+    Type = struct.layer_type
+    Epsilon = [Epsilon_mat[i] for i in Type]
     thickness = copy.deepcopy(struct.thickness)
     # In order to ensure that the phase reference is at the beginning
-    # of the first layer. Totally necessary when you are looking for
-    # modes of the structure, this makes the poles of the reflection
-    # coefficient much more visible.
+    # of the first layer.
     thickness[0] = 0
-    Type = struct.layer_type
-    # Wavevector in vacuum.
+
+    if len(struct.thickness) != len(struct.layer_type):
+        print(
+            f"ArgumentMatchError : layer_type has {len(struct.layer_type)} arguments and thickness has {len(struct.thickness)} arguments")
+        return None
+
+    # The boundary conditions will change when the polarization changes. (A demander à Antoine pourquoi)
+    if polarization == 0:
+        print("Non local materials should be used with polarization = 1 (TM)")
+        return 0
+    else:
+        f = Epsilon
+
     k0 = 2 * np.pi / wavelength
+    g = len(Type)
+    omega_p = [0] * (g - 1)
+    chi_b = [0] * (g - 1)
+    chi_f = [0] * (g - 1)
+    beta2 = [0] * (g)
+    for k in range(g - 1):
+        if struct.materials[Type[k]].specialType == "NonLocal":
+            beta2[k], chi_b[k], chi_f[k], omega_p[k] = struct.materials[Type[k]].get_values_nl(wavelength)
 
-    Epsilon = [Epsilon_mat[i] for i in Type]  # to use it in NLcoefficient
+    gamma = np.array(np.sqrt([(1 + 0j) * Epsilon[i] * k0 ** 2 - alpha ** 2 for i in range(g)]), dtype=complex)
+    # print(f"Données \nEpsilon vaut {Epsilon} \nMu vaut {Mu} \nType vaut {Type} \nthickness vaut {thickness} \nalpha vaut {alpha}  \ngamma vaut {gamma} \nbeta vaut {beta}")
 
-    r, _, _, _ = NL.NLcoefficient(struct, wavelength, np.arcsin(alpha / (k0 * np.sqrt(Epsilon[0]))), polarization)
+    # Changing the determination of the square root in the external medium
+    # to better see the structure of the complex plane.
+    gamma[0] = gamma[0] * (
+            1 - 2 * (np.angle(gamma[0]) < -np.pi / 5))
+    gamma[g - 1] = gamma[g - 1] * (
+            1 - 2 * (np.angle(gamma[g - 1]) < -np.pi / 5))
+    T = []
+    thickness[0] = 0
+    T.append(np.array([[0, 1], [1, 0]], dtype=complex))
+    # print(f"Matrice {0} de couche locale (initialisation) \nt vaut : {1., 1.0j}, \n {T[0]}")
+
+    for k in range(g - 1):
+        # Stability of square root in complex world :)
+        if np.imag(gamma[k + 1]) < 0:
+            gamma[k + 1] *= -1
+
+        b1 = gamma[k] / f[k]
+        b2 = gamma[k + 1] / f[k + 1]
+        # print(f"b1 vaut {b1} \nb2 vaut {b2}")
+
+        # local layer matrix
+        if beta2[k] == 0:
+            t = np.exp(1j * gamma[k] * thickness[k])
+            T.append(np.array([[0, t],
+                               [t, 0]], dtype=complex))
+
+            if beta2[k + 1] == 0:
+                # local local interface
+                T.append(np.array([[b1 - b2, 2 * b2],
+                                   [2 * b1, b2 - b1]] / (b1 + b2), dtype=complex))
+
+            else:
+                # local non-local interface
+                Kl = np.sqrt(
+                    alpha ** 2 + (omega_p[k + 1] ** 2 / beta2[k + 1]) * (1 / chi_f[k + 1] + 1 / (1 + chi_b[k + 1])))
+                omega = (alpha ** 2 / Kl) * (1 / Epsilon[k + 1] - 1 / (1 + chi_b[k + 1]))
+
+                T.append(np.array([[b1 - b2 + 1j * omega, 2 * b2, 2],
+                                   [2 * b1, b2 - b1 + 1j * omega, 2],
+                                   [2 * 1j * omega * b1, 2 * 1j * omega * b2, b1 + b2 + 1j * omega]] / (
+                                              b1 + b2 - 1j * omega), dtype=complex))
+                # print(f"Matrice {2 * k + 1} de couche locale \nt vaut : {t} \n {T[2 * k + 1]}")
+
+        else:  # if beta[k] != 0 :
+            Kl = np.sqrt(alpha ** 2 + (omega_p[k] ** 2 / beta2[k]) * (1 / chi_f[k] + 1 / (1 + chi_b[k])))
+            omega = (alpha ** 2 / Kl) * (1 / Epsilon[k] - 1 / (1 + chi_b[k]))
+            t = np.exp(1j * gamma[k] * thickness[k])
+            l = np.exp(- Kl * thickness[k])
+            T.append(np.array([[0, 0, t, 0],
+                               [0, 0, 0, l],
+                               [t, 0, 0, 0],
+                               [0, l, 0, 0]], dtype=complex))
+            # print(f"Matrice {2 * k + 1} de couche non-locale \nt vaut : {t} \nl vaut : {l} \n, {T[2 * k + 1]}")
+
+            if k == g - 2 or beta2[k + 1] == 0:
+                # non-local local interface
+                T.append(np.array([[b1 - b2 + 1j * omega, -2, 2 * b2],
+                                   [-2 * 1j * omega * b1, b1 + b2 + 1j * omega, -2 * 1j * omega * b2],
+                                   [2 * b1, -2, b2 - b1 + 1j * omega]] / (b1 + b2 - 1j * omega), dtype=complex))
+
+            else:
+                # non-local non-local interface
+                print("We can't use cascadage for non local - non local layers (yet)")
+
+    # Last layer
+    t = np.exp(1j * gamma[g - 1] * thickness[g - 1])
+    T.append(np.array([[0, t],
+                       [t, 0]], dtype=complex))
+    # print(f"Matrice {2 * g - 1} de couche locale, t vaut : {t} \n {T[2 * g - 1]}")
+    # print(f"kl vaut {Kl} \nomega vaut {omega}")
+
+    # INITIALISATION
+    A = T[0]  # np.array([[0, 1], [1, 0]], dtype = complex)
+
+    # Cascading scattering matrices
+    for p in range(len(T) - 1):  # len(T) - 1 = 2 * g - 1
+        A = NL.cascade_nl(A, T[p])
+    # Reflection coefficient
+    r = A[0, 0]
 
     return 1 / np.abs(r)
 
@@ -265,6 +285,46 @@ def complex_map(struct, wavelength, polarization, real_bounds, imag_bounds, n_re
     for k in range(n_real):
         for l in range(n_imag):
             T[k, l] = 1 / dispersion(M[k, l], struct, wavelength, polarization)
+
+    return X, Y, T
+
+def NLcomplex_map(struct, wavelength, polarization, real_bounds, imag_bounds, n_real, n_imag):
+    """ Maps the function `dispersion` supposed to vanish when the dispersion
+    relation is satisfied.
+
+    Args:
+        struct (Structure): object Structure describing the multilayer
+        wavelength: wavelength in vacuum (in nm)
+        polarization: 0 for TE, 1 for TM
+        real_bounds: a list giving the bounds of the effective index
+                     real part [n_min,n_max], defining the zone to
+                     explore.
+        imag_bounds: a list giving the bounds of the effective index
+                     imaginary part.
+        n_real: number of points horizontally (real part)
+        n_imag: number of points vertically (imaginary part)
+
+    Returns:
+        X (1D numpy array): values of the real part of the effective index
+        Y (1D numpy array): values of the imaginary part of the effective index
+        T (2D numpy array): values of the dispersion function
+
+    In order to visualize the map, just use :
+        import matplotlib.pyplot as plt
+        plt.contourf(X,Y,np.sqrt(np.real(T)))
+        plt.show()
+    """
+
+    k_0 = 2 * np.pi / wavelength
+    X = np.linspace(real_bounds[0], real_bounds[1], n_real)
+    Y = np.linspace(imag_bounds[0], imag_bounds[1], n_imag)
+    xa, xb = np.meshgrid(X * k_0, Y * k_0)
+    M = xa + 1j * xb
+
+    T = np.zeros((n_real, n_imag), dtype=complex)
+    for k in range(n_real):
+        for l in range(n_imag):
+            T[k, l] = 1 / NLdispersion(M[k, l], struct, wavelength, polarization)
 
     return X, Y, T
 
@@ -547,7 +607,7 @@ def steepest(start, tol, step_max, struct, wl, pol):
 
     # print("End of the loop")
     if step == step_max:
-        print("Warning: maximum number of steps reached. Final n_eff:", z / k_0) # Denis
+        print("Warning: maximum number of steps reached. Final n_eff:", z / k_0, 'final value', current)
 
     return z / k_0
 
@@ -612,7 +672,7 @@ def NLsteepest(start, tol, step_max, struct, wl, pol):
 
     # print("End of the loop")
     if step == step_max:
-        print("Warning: maximum number of steps reached. Final n_eff:", z / k_0)
+        print("Warning: maximum number of steps reached. Final n_eff:", z / k_0, 'final value', current)
 
     return z / k_0
 
