@@ -92,9 +92,9 @@ class NLStructure(Structure):
         self.layer_type = layer_type
         self.thickness = thickness
 
-        if materials_final[layer_type[0]].specialType == "NonLocal" or materials_final[
-            layer_type[-1]].specialType == "NonLocal":
-            raise Exception("Superstrate's and Substrate's material have to be local !")
+       # if materials_final[layer_type[0]].specialType == "NonLocal" or materials_final[
+        #    layer_type[-1]].specialType == "NonLocal":
+         #   raise Exception("Superstrate's and Substrate's material have to be local !")
 
 
 class NLMaterial(Material):
@@ -172,6 +172,32 @@ def cascade_nl(T, U):
     J = np.linalg.inv(np.eye(n, n) - E @ D)
     K = np.linalg.inv(np.eye(n, n) - D @ E)
     matrix = np.vstack((np.hstack((A + B @ J @ E @ C, B @ J @ F)), np.hstack((G @ K @ C, H + G @ K @ D @ F))))
+    return matrix
+
+def intermediaire(T, U):
+
+    n = min(np.shape(T)[0], np.shape(U)[0]) - 1
+    m = np.shape(T)[0] - n
+    p = np.shape(U)[0] - n
+
+    A = T[0:m, 0:m]
+    B = T[0:m, m: m + n]
+    C = T[m: m + n, 0:m]
+    D = T[m: m + n, m: m + n]
+
+    E = U[0:n, 0:n]
+    F = U[0:n, n: n + p]
+    G = U[n: n + p, 0:n]
+    H = U[n: n + p, n: n + p]
+
+    J = np.linalg.inv(np.eye(n, n) - E @ D)
+    K = np.linalg.inv(np.eye(n, n) - D @ E)
+    matrix = np.vstack(
+        (
+            np.hstack((K @ C, K @ D @ F)),
+            np.hstack((J @ E @ C,J @ F)),
+        )
+    )
     return matrix
 
 

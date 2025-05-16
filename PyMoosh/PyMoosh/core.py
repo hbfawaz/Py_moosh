@@ -8,6 +8,8 @@ import numpy as np
 from math import *
 import copy
 from PyMoosh.classes import conv_to_nm
+from PyMoosh.non_local import cascade_nl, intermediaire
+
 
 
 def cascade(A, B):
@@ -202,7 +204,298 @@ def field(struct, beam, window):
 
     return En
 
+def fields_NL_TL(struct, beam, window):
+    """Computes the electric (TE polarization) or magnetic (TM) field inside
+    a multilayered structure with possibly NonLocal materials illuminated by a
+    gaussian beam, and uses them to compute the rest of the fields (Hx,Hz in TE polarization
+    /Ex,Ez in TM).
+    To be precise, the derived fields need to be divided by omega*µ0 in TE
+    and omega*epsilon_0 in TM. There a missing - sign in TM, too.
 
+    Args:
+        struct (Structure): description (materials,thicknesses)of the multilayer
+        beam (Beam): description of the incidence beam
+        window (Window): description of the simulation domain
+
+    Returns:
+        En (np.array): a matrix with the complex amplitude of the field
+        Hxn (np.array): a matrix with the complex amplitude of Hx/Ex
+        Hzn (np.array): a matrix with the complex amplitude of Hz/Ez
+
+    Afterwards the matrix may be used to represent either the modulus or the
+    real part of the field.
+
+    Also, you should not use two adjacent nonlocal material layers, it doesn't work for the moment..
+    """
+
+    # Wavelength in vacuum.
+    lam = beam.wavelength
+    # Computation of all the permittivities/permeabilities
+    Epsilon, Mu = struct.polarizability(lam)
+    thickness = np.array(struct.thickness)
+    w = beam.waist
+    pol = beam.polarization
+    d = window.width
+    theta = beam.incidence
+    C = window.C
+    ny = np.floor(thickness / window.py)
+    nx = window.nx
+    Type = struct.layer_type
+    print("Pixels vertically:", int(sum(ny)))
+
+    # Number of modes retained for the description of the field
+    # so that the last mode has an amplitude < 1e-3 - you may want
+    # to change it if the structure present reflexion coefficients
+    # that are subject to very swift changes with the angle of incidence.
+
+    nmod = int(np.floor(0.83660 * d / w))
+
+    # ----------- Do not touch this part ---------------
+    l = lam / d
+    w = w / d
+    thickness = thickness / d
+
+    if pol == 0:
+        f = Mu  # print("Non local materials should be used with polarization = 1 (TM)")
+    else:
+        f = Epsilon
+    # Wavevector in vacuum, no dimension
+    k0 = 2 * np.pi / l
+    # Initialization of the field component
+    Hyn_t = np.zeros((int(sum(ny)), int(nx)))
+    Hyn_l = np.zeros((int(sum(ny)), int(nx)))
+    Exn_t = np.zeros((int(sum(ny)), int(nx)))
+    Exn_l = np.zeros((int(sum(ny)), int(nx)))
+    Ezn_t = np.zeros((int(sum(ny)), int(nx)))
+    Ezn_l = np.zeros((int(sum(ny)), int(nx)))
+    # Total number of layers
+    # g=Type.size-1
+    g = len(struct.layer_type) - 1
+
+    # non local parameters
+    omega_p = [0] * (g+1)
+    chi_b = [0] * (g+1)
+    chi_f = [0] * (g+1)
+    beta2 = [0] * (g+2)
+
+    for k in range(g):
+        if struct.materials[Type[k]].specialType == "NonLocal":
+            beta2[k], chi_b[k], chi_f[k], omega_p[k] = struct.materials[
+                Type[k]
+            ].get_values_nl(lam)
+
+    # Amplitude of the different modes
+    nmodvect = np.arange(-nmod, nmod + 1)
+    # First factor makes the gaussian beam, the second one the shift
+    # a constant phase is missing, it's just a change in the time origin.
+    X = np.exp(-(w ** 2) * np.pi ** 2 * nmodvect ** 2) * np.exp(-2 * 1j * np.pi * nmodvect * C)
+
+    # Scattering matrix corresponding to no interface.
+    T = [0] * (2 * g + 2)
+    T[0] = np.array([[0, 1], [1, 0]], dtype=complex)
+
+    for nm in np.arange(2 * nmod + 1):
+
+        alpha = np.sqrt(Epsilon[Type[0]] * Mu[Type[0]]) * k0 * np.sin(theta) + 2 * np.pi * (
+                nm - nmod
+        )
+        gamma = np.sqrt(Epsilon[Type] * Mu[Type] * k0 ** 2 - np.ones(g + 1) * alpha ** 2)
+
+        if np.real(Epsilon[Type[0]]) < 0 and np.real(Mu[Type[0]]) < 0:
+            gamma[0] = -gamma[0]
+
+        if g > 2:
+            gamma[1: g - 1] = gamma[1: g - 1] * (
+                    1 - 2 * (np.imag(gamma[1: g - 1]) < 0)
+            )
+        if (
+                np.real(Epsilon[Type[g]]) < 0
+                and np.real(Mu[Type[g]]) < 0
+                and np.real(np.sqrt(Epsilon[Type[g]] * k0 ** 2 - alpha ** 2)) != 0
+        ):
+            gamma[g] = -np.sqrt(Epsilon[Type[g]] * Mu[Type[g]] * k0 ** 2 - alpha ** 2)
+        else:
+            gamma[g] = np.sqrt(Epsilon[Type[g]] * Mu[Type[g]] * k0 ** 2 - alpha ** 2)
+
+        gf = gamma / f[Type]
+
+        for k in range(g):
+            b1 = gf[k]
+            b2 = gf[k + 1]
+            if beta2[k] == 0:  # la couche k est locale
+                t = np.exp(1j * gamma[k] * thickness[k])
+                T[2 * k + 1] = np.array([[0, t], [t, 0]], dtype=complex)
+                if beta2[k + 1] == 0:  # interface local-local
+                    T[2 * k + 2] = np.array([[b1 - b2, 2 * b2], [2 * b1, b2 - b1]], dtype=complex) / (b1 + b2)
+                else:  # interface local-non local
+                    Kl = np.sqrt(
+                        alpha ** 2
+                        + (omega_p[k + 1] ** 2 / beta2[k + 1])
+                        * (1 / chi_f[k + 1] + 1 / (1 + chi_b[k + 1]))
+                    )
+                    omega = (alpha ** 2 / Kl) * (
+                            1 / Epsilon[k + 1] - 1 / (1 + chi_b[k + 1])
+                    )
+                    T[2 * k + 2] = np.array(
+                        [
+                            [b1 - b2 + 1j * omega, 2 * b2, 2],
+                            [2 * b1, b2 - b1 + 1j * omega, 2],
+                            [
+                                2 * 1j * omega * b1,
+                                2 * 1j * omega * b2,
+                                b1 + b2 + 1j * omega,
+                            ],
+                        ]
+                        / (b1 + b2 - 1j * omega)
+                        , dtype=complex)
+            else:  # la couche k n'est pas locale
+                Kl = np.sqrt(
+                    alpha ** 2
+                    + (omega_p[k] ** 2 / beta2[k])
+                    * (1 / chi_f[k] + 1 / (1 + chi_b[k]))
+                )
+                omega = (alpha ** 2 / Kl) * (
+                        1 / Epsilon[k] - 1 / (1 + chi_b[k])
+                )
+                t = np.exp(1j * gamma[k] * thickness[k])
+                l = np.exp(-Kl * thickness[k])
+                T[2 * k + 1] = np.array(
+                    [[0, 0, t, 0], [0, 0, 0, l], [t, 0, 0, 0], [0, l, 0, 0]],
+
+                    dtype=complex)
+                if beta2[k + 1] == 0:  # non-local - local
+                    T[2 * k + 2] = np.array(
+                        [
+                            [b1 - b2 + 1j * omega, -2, 2 * b2],
+                            [
+                                -2 * 1j * omega * b1,
+                                b1 + b2 + 1j * omega,
+                                -2 * 1j * omega * b2,
+                            ],
+                            [2 * b1, -2, b2 - b1 + 1j * omega],
+                        ]
+                        / (b1 + b2 - 1j * omega),
+                        dtype=complex)
+                else:
+                    # non-local non-local interface
+                    print("We can't use cascadage for non local - non local layers (yet)")
+
+        # dernière couche
+        t = np.exp(1j * gamma[g] * thickness[g])
+        T[2 * g + 1] = np.array([[0, t], [t, 0]], dtype=complex)
+
+        # Once the scattering matrixes have been prepared, now let us combine them
+
+        H = [0] * (2 * g + 1)
+        A = [0] * (2 * g + 1)
+
+        H[0] = T[2 * g + 1]
+        A[0] = T[0]
+
+        for k in range(len(T) - 2):
+            A[k + 1] = cascade_nl(A[k], T[k + 1])
+            H[k + 1] = cascade_nl(T[len(T) - k - 2], H[k])
+
+        # And let us compute the intermediate coefficients from the scattering matrixes
+
+        I = [0] * (len(T))
+        for k in range(len(T) - 1):
+            I[k] = intermediaire(A[k], H[len(T) - k - 2])
+
+        I[2 * g + 1] = np.zeros((2, 2))
+
+        h = 0
+        t = 0
+
+        # Computation of the fields in the different layers for one mode (plane wave)
+        Hy_t = np.zeros((int(np.sum(ny)), 1), dtype=complex)
+
+        Ex_t = np.zeros((int(np.sum(ny)), 1), dtype=complex)
+        Ex_l = np.zeros((int(np.sum(ny)), 1), dtype=complex)
+
+        Ez_t = np.zeros((int(np.sum(ny)), 1), dtype=complex)
+        Ez_l = np.zeros((int(np.sum(ny)), 1), dtype=complex)
+
+        for k in range(g+1):
+            for m in range(int(ny[k])):
+                h = h + float(thickness[k]) / ny[k]
+                # The expression for the field used here is based on the assumption
+                # that the structure is illuminated from above only, with an Amplitude
+                # of 1 for the incident wave. If you want only the reflected
+                # field, take off the second term.
+
+                if beta2[k]==0 and beta2[k + 1]==0:
+
+                    Hy_t[t, 0] = I[2 * k][0, 0] * np.exp(1j * gamma[k] * h) + I[2 * k + 1][
+                    1, 0
+                    ] * np.exp(1j * gamma[k] * (thickness[k] - h))
+
+                    Ex_t[t, 0] = -gf[k] * (
+                            I[2 * k][0, 0] * np.exp(1j * gamma[k] * h)
+                            - I[2 * k + 1][1, 0] * np.exp(1j * gamma[k] * (thickness[k] - h))
+                    )
+                    Ez_t[t, 0] = alpha * Hy_t[t, 0] / f[Type[k]]
+                    Ex_l[t,0] = 0
+                    Ez_l[t, 0] = 0
+                    t += 1
+                elif beta2[k] == 0 and beta2[k + 1] != 0:
+
+                    Hy_t[t, 0] = I[2 * k][0, 0] * np.exp(1j * gamma[k] * h) + I[2 * k + 1][
+                    1, 0
+                    ] * np.exp(1j * gamma[k] * (thickness[k] - h))
+
+                    Ex_t[t, 0] = gf[k] * (
+                            I[2 * k][0, 0] * np.exp(1j * gamma[k] * h)
+                            - I[2 * k + 1][1, 0] * np.exp(1j * gamma[k] * (thickness[k] - h))
+                    )
+                    Ez_t[t, 0] = -1*alpha * Hy_t[t, 0] / f[Type[k]]
+
+                    Ex_l[t, 0] = 0
+                    Ez_l[t, 0] = 0
+                    t +=1
+
+                elif beta2[k] != 0 and beta2[k + 1] == 0:
+
+                    Kl = np.sqrt(
+                        alpha ** 2
+                        + (omega_p[k] ** 2 / beta2[k])
+                        * (1 / chi_f[k] + 1 / (1 + chi_b[k]))
+                    )
+
+                    Hy_t[t, 0] = I[2 * k][0, 0] * np.exp(1j * gamma[k] * h) + I[2 * k + 1][
+                        2, 0
+                    ] * np.exp(1j * gamma[k] * (thickness[k] - h))
+
+                    Ex_t[t, 0] = gf[k] * (
+                            I[2 * k][0, 0] * np.exp(1j * gamma[k] * h)
+                            - I[2 * k + 1][2, 0] * np.exp(1j * gamma[k] * (thickness[k] - h))
+                    )
+                    Ez_t[t, 0] = -1 * alpha * Hy_t[t, 0] / f[Type[k]]
+
+                    Ex_l[t, 0] = I[2 * k][1, 0] * np.exp(-1 * Kl * h) + I[2 * k + 1][
+                        3, 0
+                    ] * np.exp( -1* Kl * (thickness[k] - h))
+                    Ez_l[t, 0] = 1j * Kl / alpha * (I[2 * k][1, 0] * np.exp(-1*Kl * h) - I[2 * k + 1][
+                        3, 0
+                    ] * np.exp(-1* Kl * (thickness[k] - h))
+                    )
+                    t +=1
+            h = 0
+
+        Hy_t = Hy_t * np.exp(1j * alpha * np.arange(0, nx) / nx)
+        Ex_t = Ex_t * np.exp(1j * alpha * np.arange(0, nx) / nx)
+        Ex_l = Ex_l * np.exp(1j * alpha * np.arange(0, nx) / nx)
+        Ez_t = Ez_t * np.exp(1j * alpha * np.arange(0, nx) / nx)
+        Ez_l = Ez_l * np.exp(1j * alpha * np.arange(0, nx) / nx)
+
+
+        Hyn_t = Hyn_t + X[int(nm)] * Hy_t
+        Exn_t = Exn_t + X[int(nm)] * Ex_t
+        Exn_l = Exn_l + X[int(nm)] * Ex_l
+        Ezn_t = Ezn_t + X[int(nm)] * Ez_t
+        Ezn_l = Ezn_l + X[int(nm)] * Ez_l
+        print(Hyn_t)
+    return Hyn_t,Hyn_l,Exn_t,Exn_l,Ezn_t,Ezn_l
 def fields(struct, beam, window):
     """Computes the electric (TE polarization) or magnetic (TM) field inside
     a multilayered structure illuminated by a gaussian beam, and uses them
@@ -299,6 +592,7 @@ def fields(struct, beam, window):
         gf = gamma / f[Type]
         for k in range(g):
             t = np.exp(1j * gamma[k] * thickness[k])
+            print(t)
             T[2 * k + 1] = np.array([[0, t], [t, 0]])
             b1 = gf[k]
             b2 = gf[k + 1]
