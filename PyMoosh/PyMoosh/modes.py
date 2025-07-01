@@ -770,3 +770,191 @@ def profile(struct, n_eff, wavelength, polarization, pixel_size=3):
 
     x = np.linspace(0, sum(thickness), len(E))
     return x, E
+
+
+def nlprofile(struct, n_eff, wavelength, polarization, pixel_size=3):
+    """
+    Computes the field profile of a guided mode in a multilayer structure 
+    that may contain non-local materials, inspired by NLcoefficient.
+    
+    This function extends the profile function to handle non-local materials
+    by using the non-local scattering matrix formalism.
+
+    Args:
+        struct (Structure): object Structure describing the multilayer with
+                          potential non-local materials
+        n_eff (complex): effective index of the mode
+        wavelength (float): wavelength in vacuum (in nm) 
+        polarization (int): 0 for TE, 1 for TM (non-local materials should use TM)
+        pixel_size (float): spatial resolution in nm
+
+    Returns:
+        x (1D numpy array): spatial coordinates along the structure
+        E (1D numpy array): complex electric field amplitude profile
+        E_nl (1D numpy array): complex non-local field component (where applicable)
+
+    .. warning: Non-local materials should be used with polarization = 1 (TM)
+    Also, you should not use two adjacent nonlocal material layers.
+    """
+    
+    if (struct.unit != "nm"):
+        wavelength = conv_to_nm(wavelength, struct.unit)
+
+    # The boundary conditions will change when the polarization changes
+    if polarization == 0:
+        print("Non local materials should be used with polarization = 1 (TM)")
+        # Fall back to regular profile for TE
+        return profile(struct, n_eff, wavelength, polarization, pixel_size)
+
+    # Wavevector in vacuum
+    k_0 = 2 * np.pi / wavelength
+    # Wavevector of the mode considered here
+    alpha = n_eff * k_0
+    
+    # About the structure:
+    Epsilon_mat, Mu_mat = struct.polarizability(wavelength)
+    Type = struct.layer_type
+    Epsilon = [Epsilon_mat[i] for i in Type]
+    thickness = copy.deepcopy(struct.thickness)
+    # In order to ensure that the phase reference is at the beginning
+    # of the first layer.
+    thickness[0] = 0
+    
+    if len(struct.thickness) != len(struct.layer_type):
+        print(f"ArgumentMatchError : layer_type has {len(struct.layer_type)} arguments and thickness has {len(struct.thickness)} arguments")
+        return None
+
+    f = Epsilon  # TM polarization
+    g = len(Type)
+    
+    # Initialize non-local parameters
+    omega_p = [0] * (g - 1)
+    chi_b = [0] * (g - 1)  
+    chi_f = [0] * (g - 1)
+    beta2 = [0] * g
+    
+    # Extract non-local parameters for each layer
+    for k in range(g - 1):
+        if struct.materials[Type[k]].specialType == "NonLocal":
+            beta2[k], chi_b[k], chi_f[k], omega_p[k] = struct.materials[Type[k]].get_values_nl(wavelength)
+
+    # Computation of the vertical wavevectors gamma
+    gamma = np.array(np.sqrt([(1 + 0j) * Epsilon[i] * k_0 ** 2 - alpha ** 2 for i in range(g)]), dtype=complex)
+    
+    # Changing the determination of the square root in the external medium
+    # to better see the structure of the complex plane.
+    gamma[0] = gamma[0] * (1 - 2 * (np.angle(gamma[0]) < -np.pi / 5))
+    gamma[g - 1] = gamma[g - 1] * (1 - 2 * (np.angle(gamma[g - 1]) < -np.pi / 5))
+    
+    # Build scattering matrices for non-local structure
+    T = []
+    T.append(np.array([[0, 1], [1, 0]], dtype=complex))
+    
+    for k in range(g - 1):
+        # Stability of square root in complex world :)
+        if np.imag(gamma[k + 1]) < 0:
+            gamma[k + 1] *= -1
+
+        b1 = gamma[k] / f[k]
+        b2 = gamma[k + 1] / f[k + 1]
+        
+        # Build layer and interface matrices depending on local/non-local nature
+        if beta2[k] == 0:  # Local layer
+            t = np.exp(1j * gamma[k] * thickness[k])
+            T.append(np.array([[0, t], [t, 0]], dtype=complex))
+            
+            if beta2[k + 1] == 0:
+                # local-local interface
+                T.append(np.array([[b1 - b2, 2 * b2],
+                                   [2 * b1, b2 - b1]] / (b1 + b2), dtype=complex))
+            else:
+                # local-nonlocal interface  
+                Kl = np.sqrt(alpha ** 2 + (omega_p[k + 1] ** 2 / beta2[k + 1]) * 
+                           (1 / chi_f[k + 1] + 1 / (1 + chi_b[k + 1])))
+                omega = (alpha ** 2 / Kl) * (1 / Epsilon[k + 1] - 1 / (1 + chi_b[k + 1]))
+                
+                T.append(np.array([[b1 - b2 + 1j * omega, 2 * b2, 2],
+                                   [2 * b1, b2 - b1 + 1j * omega, 2],
+                                   [2 * 1j * omega * b1, 2 * 1j * omega * b2, b1 + b2 + 1j * omega]] /
+                                 (b1 + b2 - 1j * omega), dtype=complex))
+        else:  # Non-local layer
+            Kl = np.sqrt(alpha ** 2 + (omega_p[k] ** 2 / beta2[k]) * 
+                        (1 / chi_f[k] + 1 / (1 + chi_b[k])))
+            omega = (alpha ** 2 / Kl) * (1 / Epsilon[k] - 1 / (1 + chi_b[k]))
+            t = np.exp(1j * gamma[k] * thickness[k])
+            l = np.exp(-Kl * thickness[k])
+            
+            T.append(np.array([[0, 0, t, 0],
+                               [0, 0, 0, l],
+                               [t, 0, 0, 0],
+                               [0, l, 0, 0]], dtype=complex))
+                             
+            if k == g - 2 or beta2[k + 1] == 0:
+                # nonlocal-local interface
+                T.append(np.array([[b1 - b2 + 1j * omega, -2, 2 * b2],
+                                   [-2 * 1j * omega * b1, b1 + b2 + 1j * omega, -2 * 1j * omega * b2],
+                                   [2 * b1, -2, b2 - b1 + 1j * omega]] /
+                                 (b1 + b2 - 1j * omega), dtype=complex))
+            else:
+                # nonlocal-nonlocal interface
+                print("We can't use cascadage for non local - non local layers (yet)")
+
+    # Last layer
+    t = np.exp(1j * gamma[g - 1] * thickness[g - 1])
+    T.append(np.array([[0, t], [t, 0]], dtype=complex))
+
+    # Cascade the scattering matrices using non-local cascade function
+    H = [0] * (len(T) - 1)
+    A = [0] * (len(T) - 1)
+    H[0] = T[-1]  # Last matrix
+    A[0] = T[0]   # First matrix
+
+    for k in range(len(T) - 2):
+        A[k + 1] = NL.cascade_nl(A[k], T[k + 1])
+        H[k + 1] = NL.cascade_nl(T[len(T) - k - 2], H[k])
+
+    # Compute intermediate coefficients using the intermediaire function
+    I = [0] * len(T)
+    for k in range(len(T) - 1):
+        I[k] = NL.intermediaire(A[k], H[len(T) - k - 2])
+
+    # Spatial discretization  
+    n_pixels = np.floor(np.array(thickness) / pixel_size).astype(int)
+    n_total = int(np.sum(n_pixels))
+    
+    # Initialize field arrays
+    E = np.zeros(n_total, dtype=complex)      # Transverse field component
+    E_nl = np.zeros(n_total, dtype=complex)   # Non-local field component
+    
+    h = 0.
+    t = 0
+
+    # Compute field profile in each layer
+    for k in range(g):
+        for m in range(int(n_pixels[k])):
+            h = h + pixel_size
+            
+            if beta2[k] == 0:  # Local layer
+                # Standard field calculation for local layers
+                if k < len(I) - 1:  # Make sure we have the right coefficients
+                    E[t] = I[2 * k][0, 0] * np.exp(1j * gamma[k] * h) + \
+                           I[2 * k + 1][1, 0] * np.exp(1j * gamma[k] * (thickness[k] - h))
+                E_nl[t] = 0.0  # No non-local component
+            else:  # Non-local layer
+                # Field calculation for non-local layers includes both components
+                Kl = np.sqrt(alpha ** 2 + (omega_p[k] ** 2 / beta2[k]) * 
+                            (1 / chi_f[k] + 1 / (1 + chi_b[k])))
+                
+                if k < len(I) - 1:
+                    # Transverse component (propagating waves)
+                    E[t] = I[2 * k][0, 0] * np.exp(1j * gamma[k] * h) + \
+                           I[2 * k + 1][2, 0] * np.exp(1j * gamma[k] * (thickness[k] - h))
+                    
+                    # Non-local component (evanescent waves)
+                    E_nl[t] = I[2 * k][1, 0] * np.exp(-Kl * h) + \
+                              I[2 * k + 1][3, 0] * np.exp(-Kl * (thickness[k] - h))
+            t += 1
+        h = 0
+
+    x = np.linspace(0, sum(thickness), len(E))
+    return x, E, E_nl
